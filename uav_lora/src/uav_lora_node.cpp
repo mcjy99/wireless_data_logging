@@ -1,6 +1,6 @@
 #include "rclcpp/rclcpp.hpp"
 #include "uav_comms_msgs/msg/lora_info_stamped.hpp"
-#include "uav_comms_msgs/msg/lora_params_info_stamped.hpp"
+//#include "uav_comms_msgs/msg/lora_params_info_stamped.hpp"
 #include <stdio.h>
 #include <string>
 #include <iostream>
@@ -17,47 +17,24 @@ using namespace std::chrono_literals;
 class UavLoraNode : public rclcpp::Node
 {
 public:
-    UavLoraNode() : Node("uav_lora_node"), serial_port(-1), actual_sf_(0), actual_tx_power_(0)
+    UavLoraNode() : Node("uav_lora_node")
     {
-        this->declare_parameter<std::string>("port", "/dev/ttyTHS1");
+        this->declare_parameter<std::string>("port", "/dev/ttyTHS1"); //serial port
         port_ = this->get_parameter("port").as_string();
-        this->declare_parameter<std::string>("sf", "7");
+        this->declare_parameter<std::string>("sf", "7"); //spreading factor
         sf_ = this->get_parameter("sf").as_string();
-        this->declare_parameter<std::string>("tp", "14");
+        this->declare_parameter<std::string>("bw","125"); //bandwidth
+        bw_ = this->get_parameter("bw").as_string();
+        this->declare_parameter<std::string>("tp", "14"); //tx power
         tp_ = this->get_parameter("tp").as_string();
 
-        params_publisher_ = this->create_publisher<uav_comms_msgs::msg::LoraParamsInfoStamped>("lora_params", 10);
         data_publisher_ = this->create_publisher<uav_comms_msgs::msg::LoraInfoStamped>("lora_info", 10);
         timer_ = this->create_wall_timer(100ms, std::bind(&UavLoraNode::lora_receive, this));
-        params_timer_ = this->create_wall_timer(10s, std::bind(&UavLoraNode::publish_params, this));
         
         if (!setup_serial())
         {
             RCLCPP_ERROR(this->get_logger(), "Failed to initialise serial port");
             return;
-        }
-    }
-
-    void publish_params()
-    {
-        // Only publish if we have valid configuration data
-        if (actual_freq_ > 0 && actual_bw_ > 0 && actual_sf_ > 0 && actual_tx_power_ > 0)
-        {
-            auto config_message = uav_comms_msgs::msg::LoraParamsInfoStamped();
-            config_message.header.stamp = this->now();
-            config_message.header.frame_id = "lora_config";
-            config_message.frequency = actual_freq_;
-            config_message.bandwidth = actual_bw_;
-            config_message.spreading_factor = actual_sf_;
-            config_message.tx_power = actual_tx_power_;
-            
-            params_publisher_->publish(config_message);
-            RCLCPP_DEBUG(this->get_logger(), "Published params - F:%u Hz, BW:%u kHz, SF:%u, TX Power:%u dBm", 
-                       actual_freq_, actual_bw_, actual_sf_, actual_tx_power_);
-        }
-        else
-        {
-            RCLCPP_WARN(this->get_logger(), "Cannot publish params - configuration not available");
         }
         config_lora();
         RCLCPP_INFO(this->get_logger(), "LoRa logging node initialised");
@@ -73,20 +50,6 @@ public:
     }
 
 private:
-    std::string port_;
-    std::string sf_;
-    std::string tp_;
-    int serial_port;
-    // Class member variables for actual config values
-    uint32_t actual_freq_;
-    uint8_t actual_bw_;
-    uint8_t actual_sf_;
-    uint8_t actual_tx_power_;
-    
-    rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::TimerBase::SharedPtr params_timer_;
-    rclcpp::Publisher<uav_comms_msgs::msg::LoraParamsInfoStamped>::SharedPtr params_publisher_;
-    rclcpp::Publisher<uav_comms_msgs::msg::LoraInfoStamped>::SharedPtr data_publisher_;
 
     bool setup_serial() // setup serial port
     {
@@ -97,6 +60,8 @@ private:
             RCLCPP_ERROR(this->get_logger(), "Error %i from open: %s", errno, strerror(errno));
             return false;
         }
+        int flags = fcntl(serial_port,F_GETFL,0);
+        fcntl(serial_port,F_SETFL,flags | O_NONBLOCK);
         
         struct termios tty;
         memset(&tty, 0, sizeof tty);
@@ -134,81 +99,12 @@ private:
         return true;
     }
 
-    void config_lora()
+    void config_lora() // send initial commands to set params before receiving
     {
-        // send initial commands
         serial_write("AT+MODE=TEST");
-        std::string params = "AT+TEST=RFCFG,923,SF" + sf_ + ",125,8,8," + tp_ + ",ON,OFF,OFF";
-        serial_write(params);
-        
-        // Send AT+TEST command and read the configuration response
-        write(serial_port, "AT+TEST", 7);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        
-        char response[512];
-        memset(response, 0, sizeof(response));
-        int n = read(serial_port, response, sizeof(response));
-        
-        if (n > 0)
-        {
-            std::string config_response(response);
-            RCLCPP_INFO(this->get_logger(), "%s", response);
-            
-            // Fixed regex patterns to match actual output format
-            std::regex freq_pattern("F:(\\d+)");  // This will capture the full frequency
-            std::smatch freq_matches;
-
-            std::regex bandwidth_pattern("BW(\\d+)K");
-            std::smatch bandwidth_matches;
-
-            std::regex sf_pattern("SF(\\d+)");
-            std::smatch sf_matches;
-            
-            std::regex pow_pattern("POW:(\\d+)dBm");
-            std::smatch pow_matches;
-            
-            // Parse frequency (will be in Hz, e.g., 923000000)
-            if (std::regex_search(config_response, freq_matches, freq_pattern) && freq_matches.size() >= 2)
-            {
-                actual_freq_ = std::stoul(freq_matches[1].str());
-            }
-
-            // Parse bandwidth (will be in kHz, e.g., 125)
-            if (std::regex_search(config_response, bandwidth_matches, bandwidth_pattern) && bandwidth_matches.size() >= 2)
-            {
-                actual_bw_ = std::stoi(bandwidth_matches[1].str());
-            }
-            
-            // Parse spreading factor
-            if (std::regex_search(config_response, sf_matches, sf_pattern) && sf_matches.size() >= 2)
-            {
-                actual_sf_ = std::stoi(sf_matches[1].str());
-            }
-            
-            // Parse TX power
-            if (std::regex_search(config_response, pow_matches, pow_pattern) && pow_matches.size() >= 2)
-            {
-                actual_tx_power_ = std::stoi(pow_matches[1].str());
-            }
-            
-            // Publish configuration message once
-            if (actual_freq_ > 0 && actual_bw_ > 0 && actual_sf_ > 0 && actual_tx_power_ > 0)
-            {
-                RCLCPP_INFO(this->get_logger(), "LoRa configuration parsed successfully - F:%u Hz, BW:%u kHz, SF:%u, TX Power:%u dBm", 
-                           actual_freq_, actual_bw_, actual_sf_, actual_tx_power_);
-            }
-            else
-            {
-                RCLCPP_WARN(this->get_logger(), "Failed to parse LoRa params. F:%u, BW:%u, SF:%u, POW:%u", 
-                           actual_freq_, actual_bw_, actual_sf_, actual_tx_power_);
-            }
-        }
-        else
-        {
-            RCLCPP_WARN(this->get_logger(), "No response received from AT+TEST command");
-        }
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::string params = "AT+TEST=RFCFG,923,SF" + sf_ + "," + bw_ + ",8,8," + tp_ + ",ON,OFF,OFF";
+        serial_write(params); //AT+TEST=RFCFG,923,SF12,125,8,8,14,ON,OFF,OFF
+        //serial_write("AT+TEST"); //check params
         serial_write("AT+TEST=RXLRPKT");
     }
 
@@ -277,6 +173,13 @@ private:
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
+    std::string port_;
+    int serial_port;
+    std::string sf_;
+    std::string bw_;
+    std::string tp_;
+    rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::Publisher<uav_comms_msgs::msg::LoraInfoStamped>::SharedPtr data_publisher_;
 };
 
 int main(int argc, char *argv[])
